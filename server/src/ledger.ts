@@ -154,3 +154,87 @@ export async function postTransaction(input: PostTransactionInput): Promise<Tran
 function isUniqueViolation(err: unknown): boolean {
   return typeof err === "object" && err !== null && (err as { code?: string }).code === "23505";
 }
+
+export interface BalanceResult {
+  account: string;
+  accountType: string;
+  balance: number;
+  asOf: string;
+}
+
+/**
+ * Current (or point-in-time) balance for one account, DERIVED by summing its
+ * entries — there is no stored balance to read.
+ *
+ * The normal-balance rule lives in the CASE below: for asset/expense accounts a
+ * debit increases the balance; for liability/revenue/equity a credit does. The
+ * `asOf` cutoff is the ONLY difference between "balance now" and "balance last
+ * Tuesday" — that falls out of storing immutable entries for free.
+ */
+export async function getBalance(accountName: string, asOf?: Date): Promise<BalanceResult> {
+  const acc = await pool.query<{ id: number; type: string }>(
+    "SELECT id, type FROM accounts WHERE name = $1",
+    [accountName],
+  );
+  if (acc.rows.length === 0) {
+    throw new LedgerError(`Unknown account: ${accountName}`, "unknown_account", 404);
+  }
+  const asOfTs = asOf ?? new Date();
+
+  // ::bigint keeps the SUM as INT8 so node-postgres returns a JS number, not a
+  // NUMERIC string. Safe: money is integers and well within Number range here.
+  const { rows } = await pool.query<{ balance: number }>(
+    `SELECT COALESCE(SUM(
+        CASE
+          WHEN a.type IN ('asset', 'expense')
+            THEN CASE WHEN le.direction = 'debit'  THEN le.amount ELSE -le.amount END
+          ELSE CASE WHEN le.direction = 'credit' THEN le.amount ELSE -le.amount END
+        END
+      ), 0)::bigint AS balance
+       FROM ledger_entries le
+       JOIN accounts a ON a.id = le.account_id
+      WHERE le.account_id = $1
+        AND le.created_at <= $2`,
+    [acc.rows[0].id, asOfTs],
+  );
+
+  return {
+    account: accountName,
+    accountType: acc.rows[0].type,
+    balance: rows[0].balance,
+    asOf: asOfTs.toISOString(),
+  };
+}
+
+export interface TrialBalanceResult {
+  balanced: boolean;
+  net: number;
+  totalDebits: number;
+  totalCredits: number;
+  asOf: string;
+}
+
+/**
+ * The whole-ledger invariant: across every entry, debits minus credits must be
+ * zero. If `net` is ever nonzero, the books are broken.
+ */
+export async function trialBalance(asOf?: Date): Promise<TrialBalanceResult> {
+  const asOfTs = asOf ?? new Date();
+  const { rows } = await pool.query<{ debits: number; credits: number; net: number }>(
+    `SELECT
+        COALESCE(SUM(CASE WHEN direction = 'debit'  THEN amount ELSE 0 END), 0)::bigint AS debits,
+        COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount ELSE 0 END), 0)::bigint AS credits,
+        COALESCE(SUM(CASE WHEN direction = 'debit'  THEN amount ELSE -amount END), 0)::bigint AS net
+       FROM ledger_entries
+      WHERE created_at <= $1`,
+    [asOfTs],
+  );
+  const r = rows[0];
+  return {
+    balanced: r.net === 0,
+    net: r.net,
+    totalDebits: r.debits,
+    totalCredits: r.credits,
+    asOf: asOfTs.toISOString(),
+  };
+}

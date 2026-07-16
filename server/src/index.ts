@@ -1,7 +1,7 @@
 import express from "express";
 import { config } from "./config.js";
 import { pool } from "./db.js";
-import { LedgerError, postTransaction } from "./ledger.js";
+import { getBalance, LedgerError, postTransaction, trialBalance } from "./ledger.js";
 import { postTransactionSchema } from "./schemas.js";
 
 const app = express();
@@ -29,13 +29,52 @@ app.post("/transactions", async (req, res) => {
     // 200 for an idempotent replay, 201 when a new transaction was written.
     res.status(result.replayed ? 200 : 201).json(result);
   } catch (err) {
-    if (err instanceof LedgerError) {
-      return res.status(err.statusCode).json({ error: err.code, message: err.message });
-    }
-    console.error(err);
-    res.status(500).json({ error: "internal" });
+    sendError(res, err);
   }
 });
+
+// Current or point-in-time balance for one account. ?asOf=<ISO timestamp>.
+app.get("/accounts/:name/balance", async (req, res) => {
+  const asOf = parseAsOf(req.query.asOf);
+  if (asOf === "invalid") {
+    return res.status(400).json({ error: "validation", message: "asOf must be an ISO timestamp" });
+  }
+  try {
+    res.json(await getBalance(req.params.name, asOf));
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// Whole-ledger trial balance. ?asOf=<ISO timestamp> for point-in-time.
+app.get("/ledger/trial-balance", async (req, res) => {
+  const asOf = parseAsOf(req.query.asOf);
+  if (asOf === "invalid") {
+    return res.status(400).json({ error: "validation", message: "asOf must be an ISO timestamp" });
+  }
+  try {
+    res.json(await trialBalance(asOf));
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+/** Map a query param to a Date, `undefined` (absent), or "invalid". */
+function parseAsOf(raw: unknown): Date | undefined | "invalid" {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string") return "invalid";
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? "invalid" : d;
+}
+
+function sendError(res: express.Response, err: unknown): void {
+  if (err instanceof LedgerError) {
+    res.status(err.statusCode).json({ error: err.code, message: err.message });
+    return;
+  }
+  console.error(err);
+  res.status(500).json({ error: "internal" });
+}
 
 const server = app.listen(config.port, () => {
   console.log(`ledger API listening on http://localhost:${config.port}`);
