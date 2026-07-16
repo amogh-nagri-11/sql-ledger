@@ -1,11 +1,37 @@
 import express from "express";
 import { config } from "./config.js";
 import { pool } from "./db.js";
-import { getBalance, LedgerError, postTransaction, trialBalance } from "./ledger.js";
+import {
+  getBalance,
+  getStatement,
+  LedgerError,
+  listAccounts,
+  postTransaction,
+  trialBalance,
+} from "./ledger.js";
 import { postTransactionSchema } from "./schemas.js";
 
 const app = express();
 app.use(express.json());
+
+// Permissive CORS so the Vite dev server (a different origin) can call the API.
+// Dev convenience only — a real deployment would scope the allowed origin.
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+// Chart of accounts (for the dashboard's selectors).
+app.get("/accounts", async (_req, res) => {
+  try {
+    res.json(await listAccounts());
+  } catch (err) {
+    sendError(res, err);
+  }
+});
 
 // Health check: proves the API is up AND can reach Postgres.
 app.get("/health", async (_req, res) => {
@@ -58,6 +84,28 @@ app.get("/ledger/trial-balance", async (req, res) => {
     sendError(res, err);
   }
 });
+
+// Account statement: entry history, newest first, with a running balance.
+app.get("/accounts/:name/statement", async (req, res) => {
+  const asOf = parseAsOf(req.query.asOf);
+  if (asOf === "invalid") {
+    return res.status(400).json({ error: "validation", message: "asOf must be an ISO timestamp" });
+  }
+  const limit = parseLimit(req.query.limit);
+  try {
+    res.json(await getStatement(req.params.name, { asOf: asOf ?? undefined, limit }));
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+/** Parse ?limit=, clamped to [1, 1000], defaulting to 100. */
+function parseLimit(raw: unknown): number {
+  if (typeof raw !== "string") return 100;
+  const n = Number.parseInt(raw, 10);
+  if (Number.isNaN(n)) return 100;
+  return Math.min(1000, Math.max(1, n));
+}
 
 /** Map a query param to a Date, `undefined` (absent), or "invalid". */
 function parseAsOf(raw: unknown): Date | undefined | "invalid" {

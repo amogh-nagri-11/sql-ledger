@@ -155,6 +155,20 @@ function isUniqueViolation(err: unknown): boolean {
   return typeof err === "object" && err !== null && (err as { code?: string }).code === "23505";
 }
 
+export interface AccountSummary {
+  id: number;
+  name: string;
+  type: string;
+}
+
+/** The chart of accounts, for populating UI selectors. */
+export async function listAccounts(): Promise<AccountSummary[]> {
+  const { rows } = await pool.query<AccountSummary>(
+    "SELECT id, name, type FROM accounts ORDER BY name",
+  );
+  return rows;
+}
+
 export interface BalanceResult {
   account: string;
   accountType: string;
@@ -204,6 +218,87 @@ export async function getBalance(accountName: string, asOf?: Date): Promise<Bala
     balance: rows[0].balance,
     asOf: asOfTs.toISOString(),
   };
+}
+
+export interface StatementEntry {
+  entryId: number;
+  transactionId: number;
+  direction: Direction;
+  amount: number;
+  /** Signed effect of this entry on THIS account's balance (+increase/-decrease). */
+  effect: number;
+  /** Balance immediately after this entry was applied. */
+  runningBalance: number;
+  description: string | null;
+  createdAt: string;
+}
+
+export interface StatementResult {
+  account: string;
+  accountType: string;
+  balance: number;
+  entries: StatementEntry[];
+}
+
+/**
+ * Entry history for one account, newest first, each row carrying a running
+ * balance. The running balance is an accumulator computed as we iterate the
+ * entries oldest→newest — NOT a stored column — then the list is reversed for
+ * display.
+ */
+export async function getStatement(
+  accountName: string,
+  opts: { asOf?: Date; limit?: number } = {},
+): Promise<StatementResult> {
+  const acc = await pool.query<{ id: number; type: string }>(
+    "SELECT id, type FROM accounts WHERE name = $1",
+    [accountName],
+  );
+  if (acc.rows.length === 0) {
+    throw new LedgerError(`Unknown account: ${accountName}`, "unknown_account", 404);
+  }
+  const type = acc.rows[0].type;
+  const asOfTs = opts.asOf ?? new Date();
+  const limit = opts.limit ?? 100;
+
+  const { rows } = await pool.query<{
+    id: number;
+    transaction_id: number;
+    amount: number;
+    direction: Direction;
+    created_at: Date;
+    description: string | null;
+  }>(
+    `SELECT le.id, le.transaction_id, le.amount, le.direction, le.created_at, t.description
+       FROM ledger_entries le
+       JOIN transactions t ON t.id = le.transaction_id
+      WHERE le.account_id = $1
+        AND le.created_at <= $2
+      ORDER BY le.created_at ASC, le.id ASC`,
+    [acc.rows[0].id, asOfTs],
+  );
+
+  const increasesOn: Direction = type === "asset" || type === "expense" ? "debit" : "credit";
+
+  let running = 0;
+  const chronological: StatementEntry[] = rows.map((r) => {
+    const effect = r.direction === increasesOn ? r.amount : -r.amount;
+    running += effect;
+    return {
+      entryId: r.id,
+      transactionId: r.transaction_id,
+      direction: r.direction,
+      amount: r.amount,
+      effect,
+      runningBalance: running,
+      description: r.description,
+      createdAt: r.created_at.toISOString(),
+    };
+  });
+
+  // Newest first for display; `running` is now the current balance.
+  const entries = chronological.reverse().slice(0, limit);
+  return { account: accountName, accountType: type, balance: running, entries };
 }
 
 export interface TrialBalanceResult {
