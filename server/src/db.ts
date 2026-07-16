@@ -13,6 +13,11 @@ pg.types.setTypeParser(pg.types.builtins.INT8, (val) =>
 export const pool = new pg.Pool({
   connectionString: config.databaseUrl,
   max: 10,
+  // Let the process exit when the pool is idle. This means test files don't
+  // have to call pool.end() themselves — which is important because they share
+  // this singleton, and one file ending it would break another that's still
+  // using it.
+  allowExitOnIdle: true,
 });
 
 /** Run a query with the shared pool. */

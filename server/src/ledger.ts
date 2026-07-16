@@ -110,17 +110,31 @@ export async function postTransaction(input: PostTransactionInput): Promise<Tran
       const existing = await findByKey(client, input.idempotencyKey);
       if (existing) return existing;
 
-      // Resolve account names to ids; reject any unknown account.
+      // Resolve account names to full rows; reject any unknown account.
       const names = [...new Set(input.legs.map((l) => l.account))];
-      const accs = await client.query<{ id: number; name: string }>(
-        "SELECT id, name FROM accounts WHERE name = ANY($1)",
-        [names],
-      );
-      const idByName = new Map(accs.rows.map((r) => [r.name, r.id]));
+      const accs = await client.query<{
+        id: number;
+        name: string;
+        type: string;
+        allow_negative: boolean;
+      }>("SELECT id, name, type, allow_negative FROM accounts WHERE name = ANY($1)", [names]);
+      const accByName = new Map(accs.rows.map((r) => [r.name, r]));
       for (const n of names) {
-        if (!idByName.has(n)) {
+        if (!accByName.has(n)) {
           throw new LedgerError(`Unknown account: ${n}`, "unknown_account", 422);
         }
+      }
+
+      // Overdraft protection. For accounts that may not go negative we take a
+      // row lock on the account BEFORE reading its derived balance. That lock
+      // serializes every concurrent writer touching the same account, so the
+      // check-then-insert is atomic even though the balance isn't stored. Lock
+      // in ascending id order to avoid deadlocks between multi-account posts.
+      const protectedAccts = [...accByName.values()]
+        .filter((a) => !a.allow_negative)
+        .sort((a, b) => a.id - b.id);
+      for (const a of protectedAccts) {
+        await client.query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE", [a.id]);
       }
 
       const tx = await client.query<{ id: number }>(
@@ -133,8 +147,22 @@ export async function postTransaction(input: PostTransactionInput): Promise<Tran
         await client.query(
           `INSERT INTO ledger_entries (transaction_id, account_id, amount, direction)
            VALUES ($1, $2, $3, $4::entry_direction)`,
-          [txId, idByName.get(l.account), l.amount, l.direction],
+          [txId, accByName.get(l.account)!.id, l.amount, l.direction],
         );
+      }
+
+      // With the entries inserted and the account still locked, recompute the
+      // derived balance (which now includes this transaction's legs) and reject
+      // if it went negative — rolling the whole thing back.
+      for (const a of protectedAccts) {
+        const bal = await balanceForAccount(client, a.id, a.type);
+        if (bal < 0) {
+          throw new LedgerError(
+            `Insufficient funds in ${a.name}: balance would be ${bal}`,
+            "insufficient_funds",
+            422,
+          );
+        }
       }
 
       return loadTransaction(client, txId, false);
@@ -153,6 +181,23 @@ export async function postTransaction(input: PostTransactionInput): Promise<Tran
 
 function isUniqueViolation(err: unknown): boolean {
   return typeof err === "object" && err !== null && (err as { code?: string }).code === "23505";
+}
+
+/** Derived balance for one account id, using an existing client (so it sees
+ *  uncommitted entries from the current transaction). */
+async function balanceForAccount(
+  runner: Pick<PoolClient, "query">,
+  accountId: number,
+  type: string,
+): Promise<number> {
+  const increasesOn: Direction = type === "asset" || type === "expense" ? "debit" : "credit";
+  const { rows } = await runner.query<{ balance: number }>(
+    `SELECT COALESCE(SUM(CASE WHEN direction = $2 THEN amount ELSE -amount END), 0)::bigint AS balance
+       FROM ledger_entries
+      WHERE account_id = $1`,
+    [accountId, increasesOn],
+  );
+  return rows[0].balance;
 }
 
 export interface AccountSummary {
@@ -217,6 +262,36 @@ export async function getBalance(accountName: string, asOf?: Date): Promise<Bala
     accountType: acc.rows[0].type,
     balance: rows[0].balance,
     asOf: asOfTs.toISOString(),
+  };
+}
+
+export interface ReconcileResult {
+  account: string;
+  ledgerBalance: number;
+  expected: number;
+  /** ledgerBalance - expected. Zero means the books agree with the outside world. */
+  difference: number;
+  reconciled: boolean;
+}
+
+/**
+ * Reconciliation: compare an account's derived ledger balance against an
+ * externally supplied figure (e.g. a bank statement total someone typed in).
+ * A nonzero difference is exactly the kind of discrepancy reconciliation exists
+ * to surface.
+ */
+export async function reconcileAccount(
+  accountName: string,
+  expected: number,
+): Promise<ReconcileResult> {
+  const bal = await getBalance(accountName); // throws unknown_account (404) if missing
+  const difference = bal.balance - expected;
+  return {
+    account: accountName,
+    ledgerBalance: bal.balance,
+    expected,
+    difference,
+    reconciled: difference === 0,
   };
 }
 

@@ -10,6 +10,7 @@
     "build": "tsc -p tsconfig.json",
     "migrate": "tsx src/scripts/migrate.ts",
     "seed": "tsx src/scripts/seed.ts",
+    "healthcheck": "tsx src/scripts/health-check.ts",
     "test": "vitest run"
   },
   "dependencies": {

@@ -7,6 +7,7 @@ import {
   LedgerError,
   listAccounts,
   postTransaction,
+  reconcileAccount,
   trialBalance,
 } from "./ledger.js";
 import { postTransactionSchema } from "./schemas.js";
@@ -94,6 +95,23 @@ app.get("/accounts/:name/statement", async (req, res) => {
   const limit = parseLimit(req.query.limit);
   try {
     res.json(await getStatement(req.params.name, { asOf: asOf ?? undefined, limit }));
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// Reconcile an account's ledger balance against an external figure.
+// ?expected=<integer cents> (may be negative).
+app.get("/accounts/:name/reconcile", async (req, res) => {
+  const raw = req.query.expected;
+  const expected = typeof raw === "string" ? Number.parseInt(raw, 10) : NaN;
+  if (Number.isNaN(expected)) {
+    return res
+      .status(400)
+      .json({ error: "validation", message: "expected must be an integer (cents)" });
+  }
+  try {
+    res.json(await reconcileAccount(req.params.name, expected));
   } catch (err) {
     sendError(res, err);
   }
